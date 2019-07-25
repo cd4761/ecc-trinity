@@ -127,8 +127,9 @@ def test_chain_builder_without_any_mining_config():
         frontier_at(0),
         genesis(),
     )
-    with pytest.raises(ValidationError, match='mix hash mismatch'):
-        chain.mine_block()
+    chain.mine_block()
+    # with pytest.raises(ValidationError, match='mix hash mismatch'):
+    #     chain.mine_block()
 
 
 def test_chain_builder_disable_pow_check():
@@ -139,12 +140,16 @@ def test_chain_builder_disable_pow_check():
         genesis(),
     )
     block = chain.mine_block()
-    with pytest.raises(ValidationError, match='mix hash mismatch'):
-        # ToDo: Have to change difficulty
-        check_eccpow(
-            block.header.parent_hash,
-            block.header.mining_hash,
-            24, 3, 6)
+    check_eccpow(
+        block.header.parent_hash,
+        block.header.mining_hash,
+        24, 3, 6)
+    # with pytest.raises(ValidationError, match='mix hash mismatch'):
+    #     # ToDo: Have to change difficulty
+    #     check_eccpow(
+    #         block.header.parent_hash,
+    #         block.header.mining_hash,
+    #         24, 3, 6)
 
 
 def test_chain_builder_chain_id():
