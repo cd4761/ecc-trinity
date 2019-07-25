@@ -3,7 +3,7 @@ import pytest
 from eth_utils import ValidationError
 
 from eth.chains.base import MiningChain
-from eth.consensus.pow import check_pow
+from eth.consensus.pow import check_eccpow
 from eth.tools.builder.chain import (
     build,
     byzantium_at,
@@ -15,7 +15,10 @@ from eth.tools.builder.chain import (
     frontier_at,
     genesis,
     homestead_at,
+    istanbul_at,
+    latest_mainnet_at,
     name,
+    petersburg_at,
     spurious_dragon_at,
     tangerine_whistle_at,
 )
@@ -26,6 +29,8 @@ from eth.vm.forks import (
     SpuriousDragonVM,
     ByzantiumVM,
     ConstantinopleVM,
+    PetersburgVM,
+    IstanbulVM,
 )
 
 
@@ -75,6 +80,9 @@ def test_chain_builder_construct_chain_vm_configuration_multiple_forks():
         (spurious_dragon_at, SpuriousDragonVM),
         (byzantium_at, ByzantiumVM),
         (constantinople_at, ConstantinopleVM),
+        (petersburg_at, PetersburgVM),
+        (istanbul_at, IstanbulVM),
+        (latest_mainnet_at, PetersburgVM),  # this will change whenever the next upgrade is locked
     )
 )
 def test_chain_builder_construct_chain_fork_specific_helpers(fork_fn, vm_class):
@@ -107,13 +115,10 @@ def test_chain_builder_enable_pow_mining():
         genesis(),
     )
     block = chain.mine_block()
-    check_pow(
-        block.number,
+    check_eccpow(
+        block.header.parent_hash,
         block.header.mining_hash,
-        block.header.mix_hash,
-        block.header.nonce,
-        block.header.difficulty,
-    )
+        24, 3, 6)
 
 
 def test_chain_builder_without_any_mining_config():
@@ -135,13 +140,11 @@ def test_chain_builder_disable_pow_check():
     )
     block = chain.mine_block()
     with pytest.raises(ValidationError, match='mix hash mismatch'):
-        check_pow(
-            block.number,
+        # ToDo: Have to change difficulty
+        check_eccpow(
+            block.header.parent_hash,
             block.header.mining_hash,
-            block.header.mix_hash,
-            block.header.nonce,
-            block.header.difficulty,
-        )
+            24, 3, 6)
 
 
 def test_chain_builder_chain_id():

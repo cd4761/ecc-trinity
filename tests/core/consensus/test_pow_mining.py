@@ -2,7 +2,7 @@ import pytest
 
 from eth.chains.base import MiningChain
 from eth.chains.mainnet import MAINNET_VMS
-from eth.consensus.pow import check_pow
+from eth.consensus.pow import check_eccpow
 from eth.tools.mining import POWMiningMixin
 from eth.tools.builder.chain import (
     genesis,
@@ -24,10 +24,10 @@ def test_mining_tools_proof_of_work_mining(base_vm_class):
     chain = genesis(ChainClass)
 
     block = chain.mine_block()
-    check_pow(
-        block.number,
+    check_eccpow(
+        block.header.parent_hash,
         block.header.mining_hash,
-        block.header.mix_hash,
-        block.header.nonce,
-        block.header.difficulty,
+        24,
+        3,
+        6
     )
