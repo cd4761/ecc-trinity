@@ -1,6 +1,6 @@
 from typing import Tuple
 
-from cytoolz import (
+from eth_utils.toolz import (
     curry,
     pipe,
 )
@@ -19,11 +19,15 @@ from eth.exceptions import (
     VMError,
 )
 
-from eth.utils.bn128 import (
+from eth.typing import (
+    BytesOrView,
+)
+
+from eth._utils.bn128 import (
     validate_point,
     FQP_point_to_FQ2_point,
 )
-from eth.utils.padding import (
+from eth._utils.padding import (
     pad32,
 )
 
@@ -60,7 +64,7 @@ def ecpairing(computation: BaseComputation) -> BaseComputation:
     return computation
 
 
-def _ecpairing(data: bytes) -> bool:
+def _ecpairing(data: BytesOrView) -> bool:
     exponent = bn128.FQ12.one()
 
     processing_pipeline = (

@@ -1,6 +1,6 @@
 from abc import (
     ABC,
-    abstractmethod
+    abstractmethod,
 )
 import itertools
 import logging
@@ -14,6 +14,7 @@ from typing import (  # noqa: F401
     Union,
 )
 
+from cached_property import cached_property
 from eth_typing import (
     Address,
 )
@@ -29,13 +30,16 @@ from eth.exceptions import (
     Halt,
     VMError,
 )
+from eth.typing import (
+    BytesOrView,
+)
 from eth.tools.logging import (
     ExtendedDebugLogger,
 )
-from eth.utils.datatypes import (
+from eth._utils.datatypes import (
     Configurable,
 )
-from eth.utils.numeric import (
+from eth._utils.numeric import (
     ceil32,
 )
 from eth.validation import (
@@ -72,6 +76,14 @@ from eth.vm.transaction_context import (
 )
 
 
+def NO_RESULT(computation: 'BaseComputation') -> None:
+    """
+    This is a special method intended for usage as the "no precompile found" result.
+    The type signature is designed to match the other precompiles.
+    """
+    raise Exception("This method is never intended to be executed")
+
+
 def memory_gas_cost(size_in_bytes: int) -> int:
     size_in_words = ceil32(size_in_bytes) // 32
     linear_cost = size_in_words * GAS_MEMORY
@@ -81,7 +93,94 @@ def memory_gas_cost(size_in_bytes: int) -> int:
     return total_cost
 
 
-class BaseComputation(Configurable, ABC):
+class BaseStackManipulation:
+    @abstractmethod
+    def stack_pop_ints(self, num_items: int) -> Tuple[int, ...]:
+        """
+        Pop and return a tuple of integers of length ``num_items`` from the stack.
+
+        Raise `eth.exceptions.InsufficientStack` if there are not enough items on
+        the stack.
+
+        Items are ordered with the top of the stack as the first item in the tuple.
+        """
+        pass
+
+    @abstractmethod
+    def stack_pop_bytes(self, num_items: int) -> Tuple[bytes, ...]:
+        """
+        Pop and return a tuple of bytes of length ``num_items`` from the stack.
+
+        Raise `eth.exceptions.InsufficientStack` if there are not enough items on
+        the stack.
+
+        Items are ordered with the top of the stack as the first item in the tuple.
+        """
+        pass
+
+    @abstractmethod
+    def stack_pop_any(self, num_items: int) -> Tuple[Union[int, bytes], ...]:
+        """
+        Pop and return a tuple of items of length ``num_items`` from the stack.
+        The type of each element will be int or bytes, depending on whether it was
+        pushed with stack_push_bytes or stack_push_int.
+
+        Raise `eth.exceptions.InsufficientStack` if there are not enough items on
+        the stack.
+
+        Items are ordered with the top of the stack as the first item in the tuple.
+        """
+        pass
+
+    @abstractmethod
+    def stack_pop1_int(self) -> int:
+        """
+        Pop and return an integer from the stack.
+
+        Raise `eth.exceptions.InsufficientStack` if the stack was empty.
+        """
+        pass
+
+    @abstractmethod
+    def stack_pop1_bytes(self) -> bytes:
+        """
+        Pop and return a bytes element from the stack.
+
+        Raise `eth.exceptions.InsufficientStack` if the stack was empty.
+        """
+        pass
+
+    @abstractmethod
+    def stack_pop1_any(self) -> Union[int, bytes]:
+        """
+        Pop and return an element from the stack.
+        The type of each element will be int or bytes, depending on whether it was
+        pushed with stack_push_bytes or stack_push_int.
+
+        Raise `eth.exceptions.InsufficientStack` if the stack was empty.
+        """
+        pass
+
+    @abstractmethod
+    def stack_push_int(self, value: int) -> None:
+        """
+        Push ``value`` onto the stack.
+
+        Raise `eth.exceptions.StackDepthLimit` if the stack is full.
+        """
+        pass
+
+    @abstractmethod
+    def stack_push_bytes(self, value: bytes) -> None:
+        """
+        Push ``value`` onto the stack.
+
+        Raise `eth.exceptions.StackDepthLimit` if the stack is full.
+        """
+        pass
+
+
+class BaseComputation(Configurable, BaseStackManipulation, ABC):
     """
     The base class for all execution computations.
 
@@ -110,8 +209,8 @@ class BaseComputation(Configurable, ABC):
     return_data = b''
     _error = None  # type: VMError
 
-    _log_entries = None  # type: List[Tuple[int, bytes, List[int], bytes]]
-    accounts_to_delete = None  # type: Dict[bytes, bytes]
+    _log_entries = None  # type: List[Tuple[int, Address, Tuple[int, ...], bytes]]
+    accounts_to_delete = None  # type: Dict[Address, Address]
 
     # VM configuration
     opcodes = None  # type: Dict[int, Any]
@@ -214,13 +313,14 @@ class BaseComputation(Configurable, ABC):
         before_cost = memory_gas_cost(before_size)
         after_cost = memory_gas_cost(after_size)
 
-        self.logger.debug2(
-            "MEMORY: size (%s -> %s) | cost (%s -> %s)",
-            before_size,
-            after_size,
-            before_cost,
-            after_cost,
-        )
+        if self.logger.show_debug2:
+            self.logger.debug2(
+                "MEMORY: size (%s -> %s) | cost (%s -> %s)",
+                before_size,
+                after_size,
+                before_cost,
+                after_cost,
+            )
 
         if size:
             if before_cost < after_cost:
@@ -243,11 +343,17 @@ class BaseComputation(Configurable, ABC):
         """
         return self._memory.write(start_position, size, value)
 
-    def memory_read(self, start_position: int, size: int) -> bytes:
+    def memory_read(self, start_position: int, size: int) -> memoryview:
+        """
+        Read and return a view of ``size`` bytes from memory starting at ``start_position``.
+        """
+        return self._memory.read(start_position, size)
+
+    def memory_read_bytes(self, start_position: int, size: int) -> bytes:
         """
         Read and return ``size`` bytes from memory starting at ``start_position``.
         """
-        return self._memory.read(start_position, size)
+        return self._memory.read_bytes(start_position, size)
 
     #
     # Gas Consumption
@@ -298,28 +404,6 @@ class BaseComputation(Configurable, ABC):
     #
     # Stack management
     #
-    def stack_pop(self, num_items: int=1, type_hint: str=None) -> Any:
-        # TODO: Needs to be replaced with
-        # `Union[int, bytes, Tuple[Union[int, bytes], ...]]` if done properly
-        """
-        Pop and return a number of items equal to ``num_items`` from the stack.
-        ``type_hint`` can be either ``'uint256'`` or ``'bytes'``.  The return value
-        will be an ``int`` or ``bytes`` type depending on the value provided for
-        the ``type_hint``.
-
-        Raise `eth.exceptions.InsufficientStack` if there are not enough items on
-        the stack.
-        """
-        return self._stack.pop(num_items, type_hint)
-
-    def stack_push(self, value: Union[int, bytes]) -> None:
-        """
-        Push ``value`` onto the stack.
-
-        Raise `eth.exceptions.StackDepthLimit` if the stack is full.
-        """
-        return self._stack.push(value)
-
     def stack_swap(self, position: int) -> None:
         """
         Swap the item on the top of the stack with the item at ``position``.
@@ -331,6 +415,41 @@ class BaseComputation(Configurable, ABC):
         Duplicate the stack item at ``position`` and pushes it onto the stack.
         """
         return self._stack.dup(position)
+
+    # Stack manipulation is performance-sensitive code.
+    # Avoid method call overhead by proxying stack method directly to stack object
+
+    @cached_property
+    def stack_pop_ints(self) -> Callable[[int], Tuple[int, ...]]:
+        return self._stack.pop_ints
+
+    @cached_property
+    def stack_pop_bytes(self) -> Callable[[int], Tuple[bytes, ...]]:
+        return self._stack.pop_bytes
+
+    @cached_property
+    def stack_pop_any(self) -> Callable[[int], Tuple[Union[int, bytes], ...]]:
+        return self._stack.pop_any
+
+    @cached_property
+    def stack_pop1_int(self) -> Callable[[], int]:
+        return self._stack.pop1_int
+
+    @cached_property
+    def stack_pop1_bytes(self) -> Callable[[], bytes]:
+        return self._stack.pop1_bytes
+
+    @cached_property
+    def stack_pop1_any(self) -> Callable[[], Union[int, bytes]]:
+        return self._stack.pop1_any
+
+    @cached_property
+    def stack_push_int(self) -> Callable[[int], None]:
+        return self._stack.push_int
+
+    @cached_property
+    def stack_push_bytes(self) -> Callable[[bytes], None]:
+        return self._stack.push_bytes
 
     #
     # Computation result
@@ -360,7 +479,7 @@ class BaseComputation(Configurable, ABC):
                               gas: int,
                               to: Address,
                               value: int,
-                              data: bytes,
+                              data: BytesOrView,
                               code: bytes,
                               **kwargs: Any) -> Message:
         """
@@ -430,7 +549,7 @@ class BaseComputation(Configurable, ABC):
             )
         self.accounts_to_delete[self.msg.storage_address] = beneficiary
 
-    def get_accounts_for_deletion(self) -> Tuple[Tuple[bytes, bytes], ...]:
+    def get_accounts_for_deletion(self) -> Tuple[Tuple[Address, Address], ...]:
         if self.is_error:
             return tuple()
         else:
@@ -442,7 +561,7 @@ class BaseComputation(Configurable, ABC):
     #
     # EVM logging
     #
-    def add_log_entry(self, account: Address, topics: List[int], data: bytes) -> None:
+    def add_log_entry(self, account: Address, topics: Tuple[int, ...], data: bytes) -> None:
         validate_canonical_address(account, title="Log entry address")
         for topic in topics:
             validate_uint256(topic, title="Log entry topic")
@@ -450,7 +569,7 @@ class BaseComputation(Configurable, ABC):
         self._log_entries.append(
             (self.transaction_context.get_next_log_counter(), account, topics, data))
 
-    def _get_log_entries(self) -> List[Tuple[int, bytes, List[int], bytes]]:
+    def _get_log_entries(self) -> List[Tuple[int, bytes, Tuple[int, ...], bytes]]:
         """
         Return the log entries for this computation and its children.
 
@@ -465,34 +584,18 @@ class BaseComputation(Configurable, ABC):
                 *(child._get_log_entries() for child in self.children)
             ))
 
-    def get_log_entries(self) -> Tuple[Tuple[bytes, List[int], bytes], ...]:
+    def get_log_entries(self) -> Tuple[Tuple[bytes, Tuple[int, ...], bytes], ...]:
         return tuple(log[1:] for log in self._get_log_entries())
 
     #
     # Context Manager API
     #
     def __enter__(self) -> 'BaseComputation':
-        self.logger.debug2(
-            (
-                "COMPUTATION STARTING: gas: %s | from: %s | to: %s | value: %s "
-                "| depth %s | static: %s"
-            ),
-            self.msg.gas,
-            encode_hex(self.msg.sender),
-            encode_hex(self.msg.to),
-            self.msg.value,
-            self.msg.depth,
-            "y" if self.msg.is_static else "n",
-        )
-
-        return self
-
-    def __exit__(self, exc_type: None, exc_value: None, traceback: None) -> None:
-        if exc_value and isinstance(exc_value, VMError):
+        if self.logger.show_debug2:
             self.logger.debug2(
                 (
-                    "COMPUTATION ERROR: gas: %s | from: %s | to: %s | value: %s | "
-                    "depth: %s | static: %s | error: %s"
+                    "COMPUTATION STARTING: gas: %s | from: %s | to: %s | value: %s "
+                    "| depth %s | static: %s"
                 ),
                 self.msg.gas,
                 encode_hex(self.msg.sender),
@@ -500,8 +603,26 @@ class BaseComputation(Configurable, ABC):
                 self.msg.value,
                 self.msg.depth,
                 "y" if self.msg.is_static else "n",
-                exc_value,
             )
+
+        return self
+
+    def __exit__(self, exc_type: None, exc_value: None, traceback: None) -> None:
+        if exc_value and isinstance(exc_value, VMError):
+            if self.logger.show_debug2:
+                self.logger.debug2(
+                    (
+                        "COMPUTATION ERROR: gas: %s | from: %s | to: %s | value: %s | "
+                        "depth: %s | static: %s | error: %s"
+                    ),
+                    self.msg.gas,
+                    encode_hex(self.msg.sender),
+                    encode_hex(self.msg.to),
+                    self.msg.value,
+                    self.msg.depth,
+                    "y" if self.msg.is_static else "n",
+                    exc_value,
+                )
             self._error = exc_value
             if self.should_burn_gas:
                 self.consume_gas(
@@ -514,7 +635,7 @@ class BaseComputation(Configurable, ABC):
 
             # suppress VM exceptions
             return True
-        elif exc_type is None:
+        elif exc_type is None and self.logger.show_debug2:
             self.logger.debug2(
                 (
                     "COMPUTATION SUCCESS: from: %s | to: %s | value: %s | "
@@ -535,14 +656,14 @@ class BaseComputation(Configurable, ABC):
     @abstractmethod
     def apply_message(self) -> 'BaseComputation':
         """
-        Execution of an VM message.
+        Execution of a VM message.
         """
         raise NotImplementedError("Must be implemented by subclasses")
 
     @abstractmethod
     def apply_create_message(self) -> 'BaseComputation':
         """
-        Execution of an VM message to create a new contract.
+        Execution of a VM message to create a new contract.
         """
         raise NotImplementedError("Must be implemented by subclasses")
 
@@ -556,19 +677,27 @@ class BaseComputation(Configurable, ABC):
         """
         with cls(state, message, transaction_context) as computation:
             # Early exit on pre-compiles
-            if message.code_address in computation.precompiles:
-                computation.precompiles[message.code_address](computation)
+            precompile = computation.precompiles.get(message.code_address, NO_RESULT)
+            if precompile is not NO_RESULT:
+                precompile(computation)
                 return computation
 
-            for opcode in computation.code:
-                opcode_fn = computation.get_opcode_fn(opcode)
+            show_debug2 = computation.logger.show_debug2
 
-                computation.logger.debug2(
-                    "OPCODE: 0x%x (%s) | pc: %s",
-                    opcode,
-                    opcode_fn.mnemonic,
-                    max(0, computation.code.pc - 1),
-                )
+            opcode_lookup = computation.opcodes
+            for opcode in computation.code:
+                try:
+                    opcode_fn = opcode_lookup[opcode]
+                except KeyError:
+                    opcode_fn = InvalidOpcode(opcode)
+
+                if show_debug2:
+                    computation.logger.debug2(
+                        "OPCODE: 0x%x (%s) | pc: %s",
+                        opcode,
+                        opcode_fn.mnemonic,
+                        max(0, computation.code.pc - 1),
+                    )
 
                 try:
                     opcode_fn(computation=computation)

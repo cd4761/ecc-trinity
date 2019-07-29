@@ -16,6 +16,5 @@ class POWMiningMixin:
         block = super().finalize_block(block)  # type: ignore
         nonce, mix_hash = pow.mine_eccpow_nonce(
             block.header.parent_hash, block.header.mining_hash, 24, 3, 6)
-        # return block.copy(header=block.header.copy(nonce=nonce))
 
         return block.copy(header=block.header.copy(nonce=nonce, mix_hash=mix_hash))

@@ -1,7 +1,7 @@
 import time
 from typing import (
+    Iterable,
     Optional,
-    Tuple,
     Union,
     overload,
 )
@@ -43,7 +43,6 @@ from .sedes import (
     uint256,
     trie_root,
 )
-
 
 class MiningHeader(rlp.Serializable):
     fields = [
@@ -144,7 +143,7 @@ class BlockHeader(rlp.Serializable):
             nonce=nonce,
         )
 
-    def __repr__(self) -> str:
+    def __str__(self) -> str:
         return '<BlockHeader #{0} {1}>'.format(
             self.block_number,
             encode_hex(self.hash)[2:10],
@@ -203,7 +202,7 @@ class BlockHeader(rlp.Serializable):
         return header
 
     def create_execution_context(
-            self, prev_hashes: Tuple[Hash32, ...]) -> ExecutionContext:
+            self, prev_hashes: Iterable[Hash32]) -> ExecutionContext:
 
         return ExecutionContext(
             coinbase=self.coinbase,

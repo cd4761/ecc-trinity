@@ -4,7 +4,7 @@ from abc import (
     abstractmethod,
 )
 import contextlib
-import functools
+import itertools
 import logging
 from typing import (
     Any,
@@ -16,30 +16,27 @@ from typing import (
 )
 from typing import Set  # noqa: F401
 
-import rlp
-
-from eth_bloom import (
-    BloomFilter,
-)
-
+from eth_hash.auto import keccak
 from eth_typing import (
     Address,
     Hash32,
 )
-
 from eth_utils import (
-    to_tuple,
     ValidationError,
 )
+import rlp
 
-from eth_hash.auto import keccak
 from eth.consensus.pow import (
+    check_pow,
     check_eccpow,
 )
 from eth.constants import (
     GENESIS_PARENT_HASH,
     MAX_PREV_HEADER_DEPTH,
     MAX_UNCLES,
+)
+from eth.db.backends.base import (
+    BaseAtomicDB,
 )
 from eth.db.trie import make_trie_root_and_nodes
 from eth.db.chain import BaseChainDB  # noqa: F401
@@ -60,19 +57,22 @@ from eth.rlp.transactions import (
     BaseTransaction,
     BaseUnsignedTransaction,
 )
-from eth.utils.datatypes import (
+from eth._utils.datatypes import (
     Configurable,
 )
-from eth.utils.db import (
+from eth._utils.db import (
     get_parent_header,
     get_block_header_by_hash,
 )
-from eth.utils.headers import (
+from eth._utils.headers import (
     generate_header_from_parent_header,
 )
 from eth.validation import (
     validate_length_lte,
     validate_gas_limit,
+)
+from eth.vm.interrupt import (
+    EVMMissingData,
 )
 from eth.vm.message import (
     Message,
@@ -88,13 +88,32 @@ class BaseVM(Configurable, ABC):
     chaindb = None  # type: BaseChainDB
     _state_class = None  # type: Type[BaseState]
 
+    @abstractmethod
+    def __init__(self, header: BlockHeader, chaindb: BaseChainDB) -> None:
+        pass
+
     @property
     @abstractmethod
     def state(self) -> BaseState:
-        raise NotImplementedError("VM classes must implement this property")
+        pass
 
+    @classmethod
     @abstractmethod
-    def __init__(self, header: BlockHeader, chaindb: BaseChainDB) -> None:
+    def build_state(
+            cls,
+            db: BaseAtomicDB,
+            header: BlockHeader,
+            previous_hashes: Iterable[Hash32] = ()) -> BaseState:
+        pass
+
+    @property
+    @abstractmethod
+    def header(self) -> BlockHeader:
+        pass
+
+    @property
+    @abstractmethod
+    def block(self) -> BaseBlock:
         pass
 
     #
@@ -112,7 +131,7 @@ class BaseVM(Configurable, ABC):
     def apply_transaction(self,
                           header: BlockHeader,
                           transaction: BaseTransaction
-                          ) -> Tuple[BlockHeader, Receipt, BaseComputation]:
+                          ) -> Tuple[Receipt, BaseComputation]:
         raise NotImplementedError("VM classes must implement this method")
 
     @abstractmethod
@@ -187,6 +206,15 @@ class BaseVM(Configurable, ABC):
     #
     # Headers
     #
+    @abstractmethod
+    def add_receipt_to_header(self, old_header: BlockHeader, receipt: Receipt) -> BlockHeader:
+        """
+        Apply the receipt to the old header, and return the resulting header. This may have
+        storage-related side-effects. For example, pre-Byzantium, the state root hash
+        is included in the receipt, and so must be stored into the database.
+        """
+        pass
+
     @classmethod
     @abstractmethod
     def compute_difficulty(cls, parent_header: BlockHeader, timestamp: int) -> int:
@@ -258,7 +286,6 @@ class BaseVM(Configurable, ABC):
 
     @classmethod
     @abstractmethod
-    @to_tuple
     def get_prev_hashes(cls,
                         last_block_hash: Hash32,
                         chaindb: BaseChainDB) -> Optional[Iterable[Hash32]]:
@@ -357,6 +384,7 @@ class BaseVM(Configurable, ABC):
 
 
 class VM(BaseVM):
+    cls_logger = logging.getLogger('eth.vm.base.VM')
     """
     The :class:`~eth.vm.base.BaseVM` class represents the Chain rules for a
     specific protocol definition such as the Frontier or Homestead network.
@@ -370,20 +398,51 @@ class VM(BaseVM):
     """
 
     _state = None
+    _block = None
 
     def __init__(self, header: BlockHeader, chaindb: BaseChainDB) -> None:
         self.chaindb = chaindb
-        self.block = self.get_block_class().from_header(header=header, chaindb=self.chaindb)
+        self._initial_header = header
+
+    @property
+    def header(self) -> BlockHeader:
+        if self._block is None:
+            return self._initial_header
+        else:
+            return self._block.header
+
+    @property
+    def block(self) -> BaseBlock:
+        if self._block is None:
+            block_class = self.get_block_class()
+            self._block = block_class.from_header(header=self._initial_header, chaindb=self.chaindb)
+        return self._block
+
+    @block.setter
+    def block(self, block: BaseBlock) -> None:
+        self._block = block
 
     @property
     def state(self) -> BaseState:
         if self._state is None:
-            self._state = self.get_state_class()(
-                db=self.chaindb.db,
-                execution_context=self.block.header.create_execution_context(self.previous_hashes),
-                state_root=self.block.header.state_root,
-            )
+            self._state = self.build_state(self.chaindb.db, self.header, self.previous_hashes)
         return self._state
+
+    @classmethod
+    def build_state(
+            cls,
+            db: BaseAtomicDB,
+            header: BlockHeader,
+            previous_hashes: Iterable[Hash32] = ()) -> BaseState:
+        """
+        You probably want `VM().state` instead of this.
+
+        Occasionally, you want to build custom state against a particular header and DB,
+        even if you don't have the VM initialized. This is a convenience method to do that.
+        """
+
+        execution_context = header.create_execution_context(previous_hashes)
+        return cls.get_state_class()(db, execution_context, header.state_root)
 
     #
     # Logging
@@ -398,7 +457,7 @@ class VM(BaseVM):
     def apply_transaction(self,
                           header: BlockHeader,
                           transaction: BaseTransaction
-                          ) -> Tuple[BlockHeader, Receipt, BaseComputation]:
+                          ) -> Tuple[Receipt, BaseComputation]:
         """
         Apply the transaction to the current block. This is a wrapper around
         :func:`~eth.vm.state.State.apply_transaction` with some extra orchestration logic.
@@ -407,17 +466,11 @@ class VM(BaseVM):
         :param transaction: to apply
         """
         self.validate_transaction_against_header(header, transaction)
-        state_root, computation = self.state.apply_transaction(transaction)
+        computation = self.state.apply_transaction(transaction)
         receipt = self.make_receipt(header, transaction, computation, self.state)
         self.validate_receipt(receipt)
 
-        new_header = header.copy(
-            bloom=int(BloomFilter(header.bloom) | receipt.bloom),
-            gas_used=receipt.gas_used,
-            state_root=state_root,
-        )
-
-        return new_header, receipt, computation
+        return receipt, computation
 
     def execute_bytecode(self,
                          origin: Address,
@@ -474,11 +527,11 @@ class VM(BaseVM):
         :param base_header: the starting header to apply transactions to
         :return: the final header, the receipts of each transaction, and the computations
         """
-        if base_header.block_number != self.block.number:
+        if base_header.block_number != self.header.block_number:
             raise ValidationError(
                 "This VM instance must only work on block #{}, "
                 "but the target header has block #{}".format(
-                    self.block.number,
+                    self.header.block_number,
                     base_header.block_number,
                 )
             )
@@ -489,11 +542,16 @@ class VM(BaseVM):
         result_header = base_header
 
         for transaction in transactions:
-            result_header, receipt, computation = self.apply_transaction(
-                previous_header,
-                transaction,
-            )
+            try:
+                snapshot = self.state.snapshot()
+                receipt, computation = self.apply_transaction(
+                    previous_header,
+                    transaction,
+                )
+            except EVMMissingData as exc:
+                self.state.revert(snapshot)
 
+            result_header = self.add_receipt_to_header(previous_header, receipt)
             previous_header = result_header
             receipts.append(receipt)
             computations.append(computation)
@@ -531,14 +589,10 @@ class VM(BaseVM):
             uncles=block.uncles,
         )
         # we need to re-initialize the `state` to update the execution context.
-        self._state = self.get_state_class()(
-            db=self.chaindb.db,
-            execution_context=self.block.header.create_execution_context(self.previous_hashes),
-            state_root=self.block.header.state_root,
-        )
+        self._state = self.build_state(self.chaindb.db, self.header, self.previous_hashes)
 
         # run all of the transactions.
-        new_header, receipts, _ = self.apply_all_transactions(block.transactions, self.block.header)
+        new_header, receipts, _ = self.apply_all_transactions(block.transactions, self.header)
 
         self.block = self.set_block_transactions(
             self.block,
@@ -555,10 +609,7 @@ class VM(BaseVM):
         """
         packed_block = self.pack_block(self.block, *args, **kwargs)
 
-        if packed_block.number == 0:
-            final_block = packed_block
-        else:
-            final_block = self.finalize_block(packed_block)
+        final_block = self.finalize_block(packed_block)
 
         # Perform validation
         self.validate_block(final_block)
@@ -588,15 +639,12 @@ class VM(BaseVM):
     #
     # Finalization
     #
-    def finalize_block(self, block: BaseBlock) -> BaseBlock:
-        """
-        Perform any finalization steps like awarding the block mining reward.
-        """
+    def _assign_block_rewards(self, block: BaseBlock) -> None:
         block_reward = self.get_block_reward() + (
             len(block.uncles) * self.get_nephew_reward()
         )
 
-        self.state.account_db.delta_balance(block.header.coinbase, block_reward)
+        self.state.delta_balance(block.header.coinbase, block_reward)
         self.logger.debug(
             "BLOCK REWARD: %s -> %s",
             block_reward,
@@ -605,16 +653,31 @@ class VM(BaseVM):
 
         for uncle in block.uncles:
             uncle_reward = self.get_uncle_reward(block.number, uncle)
-            self.state.account_db.delta_balance(uncle.coinbase, uncle_reward)
+            self.state.delta_balance(uncle.coinbase, uncle_reward)
             self.logger.debug(
                 "UNCLE REWARD REWARD: %s -> %s",
                 uncle_reward,
                 uncle.coinbase,
             )
+
+    def finalize_block(self, block: BaseBlock) -> BaseBlock:
+        """
+        Perform any finalization steps like awarding the block mining reward,
+        and persisting the final state root.
+        """
+        if block.number > 0:
+            snapshot = self.state.snapshot()
+            try:
+                self._assign_block_rewards(block)
+            except EVMMissingData as exc:
+                self.state.revert(snapshot)
+                raise
+            else:
+                self.state.commit(snapshot)
+
         # We need to call `persist` here since the state db batches
         # all writes until we tell it to write to the underlying db
-        # TODO: Refactor to only use batching/journaling for tx processing
-        self.state.account_db.persist()
+        self.state.persist()
 
         return block.copy(header=block.header.copy(state_root=self.state.state_root))
 
@@ -691,8 +754,6 @@ class VM(BaseVM):
             return cls.block_class
 
     @classmethod
-    @functools.lru_cache(maxsize=32)
-    @to_tuple
     def get_prev_hashes(cls,
                         last_block_hash: Hash32,
                         chaindb: BaseChainDB) -> Optional[Iterable[Hash32]]:
@@ -709,11 +770,11 @@ class VM(BaseVM):
                 break
 
     @property
-    def previous_hashes(self) -> Optional[Tuple[Hash32, ...]]:
+    def previous_hashes(self) -> Optional[Iterable[Hash32]]:
         """
         Convenience API for accessing the previous 255 block hashes.
         """
-        return self.get_prev_hashes(self.block.header.parent_hash, self.chaindb)
+        return self.get_prev_hashes(self.header.parent_hash, self.chaindb)
 
     #
     # Transactions
@@ -868,15 +929,31 @@ class VM(BaseVM):
                 )
 
             if check_seal:
-                cls.validate_seal(header)
+                try:
+                    cls.validate_seal(header)
+                except ValidationError:
+                    cls.cls_logger.warning(
+                        "Failed to validate header proof of work on header: %r",
+                        header.as_dict()
+                    )
+                    raise
+
+    # @classmethod
+    # def validate_seal(cls, header: BlockHeader) -> None:
+    #     """
+    #     Validate the seal on the given header.
+    #     """
+    #     check_pow(
+    #         header.block_number, header.mining_hash,
+    #         header.mix_hash, header.nonce, header.difficulty)
 
     @classmethod
-    def validate_seal(cls, header: BlockHeader) -> None:
+    def validate_seal(clscls, header: BlockHeader) -> None:
         """
-        Validate the seal on the given header.
+        Validate the seal on the given header in eccpow.
         """
+        # ToDo: Have to change difficulty parameter
         check_eccpow(header.parent_hash, header.mining_hash, 24, 3, 6)
-
 
     @classmethod
     def validate_uncle(cls, block: BaseBlock, uncle: BaseBlock, uncle_parent: BaseBlock) -> None:
@@ -916,15 +993,11 @@ class VM(BaseVM):
 
     @contextlib.contextmanager
     def state_in_temp_block(self) -> Iterator[BaseState]:
-        header = self.block.header
+        header = self.header
         temp_block = self.generate_block_from_parent_header_and_coinbase(header, header.coinbase)
-        prev_hashes = (header.hash, ) + self.previous_hashes
+        prev_hashes = itertools.chain((header.hash, ), self.previous_hashes)
 
-        state = self.get_state_class()(
-            db=self.chaindb.db,
-            execution_context=temp_block.header.create_execution_context(prev_hashes),
-            state_root=temp_block.header.state_root,
-        )
+        state = self.build_state(self.chaindb.db, temp_block.header, prev_hashes)
 
         snapshot = state.snapshot()
         yield state

@@ -17,7 +17,7 @@ from typing import (
 
 from eth.tools.logging import ExtendedDebugLogger
 
-from eth.utils.datatypes import Configurable
+from eth._utils.datatypes import Configurable
 
 if TYPE_CHECKING:
     from computation import BaseComputation     # noqa: F401
@@ -65,7 +65,7 @@ class Opcode(Configurable, ABC):
                 """
                 computation.consume_gas(
                     gas_cost,
-                    reason=mnemonic,
+                    mnemonic,
                 )
                 return logic_fn(computation)
         else:

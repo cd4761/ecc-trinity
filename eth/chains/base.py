@@ -40,7 +40,6 @@ from eth_utils.toolz import (
 )
 
 from eth.constants import (
-    BLANK_ROOT_HASH,
     EMPTY_UNCLE_HASH,
     MAX_UNCLE_DEPTH,
 )
@@ -84,16 +83,16 @@ from eth.typing import (  # noqa: F401
     StaticMethod,
 )
 
-from eth.utils.db import (
+from eth._utils.db import (
     apply_state_dict,
 )
-from eth.utils.datatypes import (
+from eth._utils.datatypes import (
     Configurable,
 )
-from eth.utils.headers import (
+from eth._utils.headers import (
     compute_gas_limit_bounds,
 )
-from eth.utils.rlp import (
+from eth._utils.rlp import (
     validate_imported_block_unchanged,
 )
 
@@ -272,6 +271,10 @@ class BaseChain(Configurable, ABC):
     def get_canonical_transaction(self, transaction_hash: Hash32) -> BaseTransaction:
         raise NotImplementedError("Chain classes must implement this method")
 
+    @abstractmethod
+    def get_transaction_receipt(self, transaction_hash: Hash32) -> Receipt:
+        raise NotImplementedError("Chain classes must implement this method")
+
     #
     # Execution API
     #
@@ -349,7 +352,16 @@ class BaseChain(Configurable, ABC):
                         child, child.parent_hash, parent.hash))
             should_check_seal = index in indices_to_check_seal
             vm_class = cls.get_vm_class_for_block_number(child.block_number)
-            vm_class.validate_header(child, parent, check_seal=should_check_seal)
+            try:
+                vm_class.validate_header(child, parent, check_seal=should_check_seal)
+            except ValidationError as exc:
+                raise ValidationError(
+                    "%s is not a valid child of %s: %s" % (
+                        child,
+                        parent,
+                        exc,
+                    )
+                ) from exc
 
 
 class Chain(BaseChain):
@@ -399,29 +411,27 @@ class Chain(BaseChain):
         """
         genesis_vm_class = cls.get_vm_class_for_block_number(BlockNumber(0))
 
-        account_db = genesis_vm_class.get_state_class().get_account_db_class()(
-            base_db,
-            BLANK_ROOT_HASH,
-        )
+        pre_genesis_header = BlockHeader(difficulty=0, block_number=-1, gas_limit=0)
+        state = genesis_vm_class.build_state(base_db, pre_genesis_header)
 
         if genesis_state is None:
             genesis_state = {}
 
         # mutation
-        apply_state_dict(account_db, genesis_state)
-        account_db.persist()
+        apply_state_dict(state, genesis_state)
+        state.persist()
 
         if 'state_root' not in genesis_params:
             # If the genesis state_root was not specified, use the value
             # computed from the initialized state database.
-            genesis_params = assoc(genesis_params, 'state_root', account_db.state_root)
-        elif genesis_params['state_root'] != account_db.state_root:
+            genesis_params = assoc(genesis_params, 'state_root', state.state_root)
+        elif genesis_params['state_root'] != state.state_root:
             # If the genesis state_root was specified, validate that it matches
             # the computed state from the initialized state database.
             raise ValidationError(
                 "The provided genesis state root does not match the computed "
                 "genesis state root.  Got {0}.  Expected {1}".format(
-                    account_db.state_root,
+                    state.state_root,
                     genesis_params['state_root'],
                 )
             )
@@ -644,6 +654,17 @@ class Chain(BaseChain):
             data=data,
         )
 
+    def get_transaction_receipt(self, transaction_hash: Hash32) -> Receipt:
+        transaction_block_number, transaction_index = self.chaindb.get_transaction_index(
+            transaction_hash,
+        )
+        receipt = self.chaindb.get_receipt_by_index(
+            block_number=transaction_block_number,
+            receipt_index=transaction_index,
+        )
+
+        return receipt
+
     #
     # Execution API
     #
@@ -683,7 +704,7 @@ class Chain(BaseChain):
 
         - the imported block
         - a tuple of blocks which are now part of the canonical chain.
-        - a tuple of blocks which are were canonical and now are no longer canonical.
+        - a tuple of blocks which were canonical and now are no longer canonical.
         """
 
         try:
@@ -750,8 +771,8 @@ class Chain(BaseChain):
         if block.is_genesis:
             raise ValidationError("Cannot validate genesis block this way")
         VM_class = self.get_vm_class_for_block_number(BlockNumber(block.number))
-        parent_block = self.get_block_by_hash(block.header.parent_hash)
-        VM_class.validate_header(block.header, parent_block.header, check_seal=True)
+        parent_header = self.get_block_header_by_hash(block.header.parent_hash)
+        VM_class.validate_header(block.header, parent_header, check_seal=True)
         self.validate_uncles(block)
         self.validate_gaslimit(block.header)
 
@@ -870,15 +891,17 @@ class MiningChain(Chain):
         Applies the transaction to the current tip block.
 
         WARNING: Receipt and Transaction trie generation is computationally
-        heavy and incurs significant perferomance overhead.
+        heavy and incurs significant performance overhead.
         """
         vm = self.get_vm(self.header)
         base_block = vm.block
 
-        new_header, receipt, computation = vm.apply_transaction(base_block.header, transaction)
+        receipt, computation = vm.apply_transaction(base_block.header, transaction)
+        header_with_receipt = vm.add_receipt_to_header(base_block.header, receipt)
 
         # since we are building the block locally, we have to persist all the incremental state
-        vm.state.account_db.persist()
+        vm.state.persist()
+        new_header = header_with_receipt.copy(state_root=vm.state.state_root)
 
         transactions = base_block.transactions + (transaction, )
         receipts = base_block.get_receipts(self.chaindb) + (receipt, )
