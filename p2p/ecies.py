@@ -20,6 +20,7 @@ from eth.utils.padding import (
     pad32,
 )
 
+
 from p2p.exceptions import DecryptionError
 
 from .constants import (
