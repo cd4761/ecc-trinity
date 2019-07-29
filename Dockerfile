@@ -8,8 +8,8 @@ RUN apt-get update
 RUN apt-get install libsnappy-dev -y
 RUN pip install -e .[dev]  --no-cache-dir
 RUN pip install -U trinity --no-cache-dir
-RUN cd .. && git clone http://github.com/cd4761/eth-ecc.git && cd eth-ecc && python setup.py install
-RUN find . -name \*.pyc -delete
+#RUN cd .. && git clone http://github.com/cd4761/eth-ecc.git && cd eth-ecc && python setup.py install
+#RUN find . -name \*.pyc -delete
 
 RUN echo "Type \`trinity\` to boot or \`trinity --help\` for an overview of commands"
 

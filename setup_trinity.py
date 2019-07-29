@@ -11,7 +11,7 @@ setup(
     description='The Trinity Ethereum Client',
     author='Ethereum Foundation',
     author_email='piper@pipermerriam.com',
-    url='https://github.com/ethereum/py-evm',
+    url='https://github.com/cd4761/ecc-py-evm',
     include_package_data=True,
     py_modules=[],
     install_requires=[
