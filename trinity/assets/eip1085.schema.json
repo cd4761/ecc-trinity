@@ -35,7 +35,7 @@
         "miningMethod": {
           "title": "The mechanism by which blocks are mined",
           "type": "string",
-          "enum": ["ethash", "NoProof"]
+          "enum": ["ethash", "NoProof", "eccpow"]
         },
         "frontierForkBlock": {
           "title": "Block number for the Frontier fork",
