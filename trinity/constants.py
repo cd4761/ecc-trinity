@@ -32,6 +32,7 @@ TO_NETWORKING_BROADCAST_CONFIG = BroadcastConfig(filter_endpoint=NETWORKING_EVEN
 # Network IDs: https://ethereum.stackexchange.com/questions/17051/how-to-select-a-network-id-or-is-there-a-list-of-network-ids/17101#17101  # noqa: E501
 MAINNET_NETWORK_ID = 1
 ROPSTEN_NETWORK_ID = 3
+PRIVATE_NETWORK_ID = 1337
 
 
 # Default preferred enodes
@@ -72,4 +73,5 @@ DEFAULT_PREFERRED_NODES: Dict[int, Tuple[Node, ...]] = {
         Node(keys.PublicKey(decode_hex("643c31104d497e3d4cd2460ff0dbb1fb9a6140c8bb0fca66159bbf177d41aefd477091c866494efd3f1f59a0652c93ab2f7bb09034ed5ab9f2c5c6841aef8d94")),  # noqa: E501
              Address("34.198.237.7", 30303, 30303)),
     ),
+    PRIVATE_NETWORK_ID: (),
 }
