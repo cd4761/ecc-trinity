@@ -62,6 +62,36 @@ from trinity.utils.validation import (
     validate_transaction_call_dict,
     validate_transaction_gas_estimation_dict,
 )
+from eth.chains.base import MiningChain
+from eth.consensus.pow import check_eccpow
+from eth.tools.builder.chain import (
+    build,
+    byzantium_at,
+    chain_id,
+    constantinople_at,
+    disable_pow_check,
+    enable_pow_mining,
+    fork_at,
+    frontier_at,
+    genesis,
+    homestead_at,
+    istanbul_at,
+    latest_mainnet_at,
+    name,
+    petersburg_at,
+    spurious_dragon_at,
+    tangerine_whistle_at,
+)
+from eth.vm.forks import (
+    FrontierVM,
+    HomesteadVM,
+    TangerineWhistleVM,
+    SpuriousDragonVM,
+    ByzantiumVM,
+    ConstantinopleVM,
+    PetersburgVM,
+    IstanbulVM,
+)
 
 
 async def get_header(chain: BaseAsyncChain, at_block: Union[str, int]) -> BlockHeader:
@@ -266,6 +296,17 @@ class Eth(RPCModule):
         raise NotImplementedError()
 
     async def mining(self) -> bool:
+        chain = build(
+            MiningChain,
+            frontier_at(0),
+            enable_pow_mining(),
+            genesis(),
+        )
+        block = chain.mine_block()
+        check_eccpow(
+            block.header.parent_hash,
+            block.header.mining_hash,
+            24, 3, 6)
         return False
 
     async def protocolVersion(self) -> str:
